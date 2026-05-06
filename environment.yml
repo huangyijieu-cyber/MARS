@@ -1,0 +1,29 @@
+name: mars
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.24.0
+  - pandas>=2.0.0
+  - scipy>=1.10.0
+  - tqdm
+  - pyarrow    
+  - rdkit>=2023.09.1
+  - faiss-cpu 
+  - psutil
+  - pip:
+      - langchain>=0.1.0
+      - langchain-openai
+      - langchain-core
+      - selfies>=2.1.1
+      - myopic-mces>=1.0.1
+      - pulp>=2.7.0  
+      - torch>=2.0.0
+      - pytorch-lightning>=1.6.0
+      - torch-geometric
+      - networkx
+      - matchms>=0.24.0
+      - pubchempy
+      - pydantic
