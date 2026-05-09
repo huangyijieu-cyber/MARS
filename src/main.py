@@ -345,6 +345,9 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     os.makedirs("data/prompt", exist_ok=True)
+    output_dir = os.path.dirname(OUTPUT_FILE_PATH)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     loader = MolecularDataLoader()
     df = loader.load_test_data(TEST_FILE_PATH, limit=MAX_TEST_SAMPLES)
