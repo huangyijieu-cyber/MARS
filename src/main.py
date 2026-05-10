@@ -9,15 +9,16 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 os.environ["LANGCHAIN_API_KEY"] = ""
 
+from config import load_config, parse_args
 from runner import register_signal_handlers, run_experiment, setup_logging
-
-SEARCH_MODE = 3
 
 
 def main():
-    setup_logging()
+    args = parse_args()
+    config = load_config(args.config)
+    setup_logging(config.run.log_level)
     register_signal_handlers()
-    run_experiment(search_mode=SEARCH_MODE)
+    run_experiment(config)
 
 
 if __name__ == "__main__":

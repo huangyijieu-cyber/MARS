@@ -1,0 +1,38 @@
+api:
+  model: deepseek-chat
+  base_url: https://api.deepseek.com
+  api_key_env:
+    - MARS_API_KEY
+    - OPENAI_API_KEY
+  temperature: 0
+
+paths:
+  faiss_db_dir: data/faiss_kb
+  test_file_path: data/NPLIB1_threshold_0.2.tsv
+  output_file_path: results/MARS_NPLIB1.csv
+
+run:
+  search_mode: 3
+  max_test_samples: null
+  pworkers: 1
+  log_level: INFO
+
+retrieval:
+  retrieval_k: 20
+  context_k: 5
+  fingerprint_dim: 4096
+
+generation:
+  top_k: 10
+  initial_max_retries: 3
+
+mcts:
+  iterations: 5
+
+docker:
+  image: wishartlab/cfmid:latest
+  cpus: 1.5
+  mem: 5g
+  pool_dir_base: /tmp/cfmid_pool_data
+  instance_id_env: INSTANCE_ID
+  default_instance_id: nplib1

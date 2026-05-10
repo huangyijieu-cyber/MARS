@@ -1,26 +1,13 @@
 import json
 import logging
-import os
-import re
 import time
 
 import pandas as pd
 
 import cfmid_adapter as cfmid_module
 from cfmid_adapter import CFMIDAdapter
-from config import (
-    API_KEY,
-    BASE_URL,
-    CONTEXT_K,
-    FAISS_DB_DIR,
-    MODEL,
-    MCTS_ITERATIONS,
-    RETRIEVAL_K,
-    TEMPERATURE,
-    TOP_K,
-)
 from custom_retriever import FaissDiceRetriever
-from evaluator import MolecularEvaluator, get_inchikey_match, robust_standardize
+from evaluator import MolecularEvaluator
 from langchain_openai import ChatOpenAI
 from mcts_engine import MCTSEngine
 from post_processor import MolecularPostProcessor
@@ -30,7 +17,7 @@ logger = logging.getLogger(__name__)
 worker_resources = {}
 
 
-def init_worker(worker_id_queue, search_mode):
+def init_worker(worker_id_queue, config):
     from rdkit import RDLogger
     import warnings
     import faiss
@@ -46,20 +33,26 @@ def init_worker(worker_id_queue, search_mode):
     RDLogger.DisableLog("rdApp.*")
     warnings.filterwarnings("ignore")
 
-    worker_resources["retriever"] = FaissDiceRetriever.load_from_dir(FAISS_DB_DIR, k=RETRIEVAL_K)
-    worker_resources["cfmid"] = CFMIDAdapter(docker_image="wishartlab/cfmid:latest")
+    worker_resources["config"] = config
+    worker_resources["retriever"] = FaissDiceRetriever.load_from_dir(
+        config.paths.faiss_db_dir,
+        k=config.retrieval.retrieval_k,
+    )
+    worker_resources["cfmid"] = CFMIDAdapter(
+        docker_image=config.docker.image,
+        instance_id=config.docker.instance_id,
+    )
     worker_resources["llm"] = ChatOpenAI(
-        model=MODEL,
-        openai_api_base=BASE_URL,
-        openai_api_key=API_KEY,
-        temperature=TEMPERATURE,
+        model=config.api.model,
+        openai_api_base=config.api.base_url,
+        openai_api_key=config.api.api_key,
+        temperature=config.api.temperature,
         request_timeout=60,
         max_retries=3,
     )
     worker_resources["evaluator"] = MolecularEvaluator(use_mces=True)
     worker_resources["post_processor"] = MolecularPostProcessor()
-    worker_resources["prompt_template"] = build_molrag_prompt(top_k=TOP_K)
-    worker_resources["search_mode"] = search_mode
+    worker_resources["prompt_template"] = build_molrag_prompt(top_k=config.generation.top_k)
 
 
 def process_single_sample(row_data):
@@ -69,7 +62,7 @@ def process_single_sample(row_data):
     evaluator = worker_resources["evaluator"]
     post_processor_inst = worker_resources["post_processor"]
     prompt_template = worker_resources["prompt_template"]
-    search_mode = worker_resources["search_mode"]
+    config = worker_resources["config"]
 
     cfmid.reset_status()
     idx = row_data["index"]
@@ -100,17 +93,12 @@ def process_single_sample(row_data):
         retrieval_query = {"fps": target_fp_list, "formula": target_formula}
         retrieved_docs = retriever.invoke(json.dumps(retrieval_query))
 
-        def simple_count(f):
-            return len(re.findall(r"[A-Z]", str(f)))
-
-        target_cnt = simple_count(target_formula)
         for doc in retrieved_docs:
-            doc.metadata["size_diff"] = abs(simple_count(doc.metadata.get("formula", "")) - target_cnt)
             if "tier_rank" not in doc.metadata:
                 doc.metadata["tier_rank"] = 99
 
         retrieved_docs.sort(key=lambda x: (x.metadata["tier_rank"], -x.metadata["score"]))
-        final_context_docs = retrieved_docs[:CONTEXT_K]
+        final_context_docs = retrieved_docs[:config.retrieval.context_k]
 
         scores = [d.metadata.get("score", 0.0) for d in final_context_docs]
         max_retr_sim = max(scores) if scores else 0.0
@@ -122,7 +110,7 @@ def process_single_sample(row_data):
             "context": context_str,
             "target_formula": target_formula,
             "target_top_peaks": target_top_peaks_str,
-            "top_k": TOP_K,
+            "top_k": config.generation.top_k,
         })
 
         mcts_engine = None
@@ -135,23 +123,19 @@ def process_single_sample(row_data):
                 target_fp=target_fp_list,
                 reference_smiles=ref_smiles_list,
                 adduct=current_adduct,
-                top_k=TOP_K,
-                true_smiles=true_smiles,
-                search_mode=search_mode,
+                top_k=config.generation.top_k,
+                search_mode=config.run.search_mode,
             )
 
         initial_candidates = []
-        initial_prompt_str = prompt_value.to_string()
-        initial_response_str = ""
-        max_init_retries = 3
+        max_init_retries = config.generation.initial_max_retries
 
         for attempt in range(max_init_retries):
             try:
-                current_temp = TEMPERATURE + (attempt * 0.3)
+                current_temp = config.api.temperature + (attempt * 0.3)
                 bound_llm = llm.bind(temperature=min(1.0, current_temp))
 
                 initial_response_msg = bound_llm.invoke(prompt_value)
-                initial_response_str = initial_response_msg.content
                 _, candidates = post_processor_inst.process_generations(
                     [initial_response_msg], target_formula, target_fp_list=target_fp_list
                 )
@@ -168,7 +152,7 @@ def process_single_sample(row_data):
                         valid_batch.append(smi)
 
                 if valid_batch:
-                    initial_candidates = valid_batch[:TOP_K]
+                    initial_candidates = valid_batch[:config.generation.top_k]
                     break
             except Exception:
                 logger.warning(
@@ -226,7 +210,7 @@ def process_single_sample(row_data):
                             logger.warning("RAG fallback initialization failed for sample=%s", idx, exc_info=True)
 
                 if is_initialized:
-                    mcts_engine.search(n_iterations=MCTS_ITERATIONS)
+                    mcts_engine.search(n_iterations=config.mcts.iterations)
                     raw_refined = mcts_engine.get_refined_top_k()
 
                     if raw_refined:
@@ -250,18 +234,6 @@ def process_single_sample(row_data):
 
         if cfmid.has_timeout:
             mcts_status = "Failed (Timeout)"
-
-        is_correct = False
-        std_true = robust_standardize(true_smiles)
-        if std_true and candidates_smiles:
-            for cand in candidates_smiles:
-                std_cand = robust_standardize(cand)
-                if std_cand and (std_cand == std_true or get_inchikey_match(std_cand, std_true)):
-                    is_correct = True
-                    break
-
-        if is_correct:
-            _write_success_prompt_trace(idx, true_smiles, initial_prompt_str, initial_response_str, mcts_engine)
 
         metrics = mcts_engine.get_search_metrics() if mcts_engine else {"valid_node_rate": 0.0, "avg_reward_delta": 0.0}
         m_top1 = evaluator.compute_metrics(true_smiles, best_pred_smiles)
@@ -289,27 +261,3 @@ def process_single_sample(row_data):
 
         tqdm.write(f"Error in sample {idx}: {e}")
         return None
-
-
-def _write_success_prompt_trace(idx, true_smiles, initial_prompt_str, initial_response_str, mcts_engine):
-    mcts_prompt_str = mcts_engine.successful_mcts_prompt if mcts_engine else None
-    mcts_resp_str = mcts_engine.successful_mcts_response if mcts_engine else None
-    safe_smiles = re.sub(r'[\\/*?:"<>|]', "_", true_smiles)
-    if not safe_smiles:
-        safe_smiles = f"unknown_{idx}"
-
-    file_name = f"{idx}_{safe_smiles}.txt"
-    file_path = os.path.join("data/prompt", file_name)
-
-    try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write("========== 1. Initial RAG Prompt ==========\n")
-            f.write(initial_prompt_str or "N/A")
-            f.write("\n\n========== 2. Initial RAG Response ==========\n")
-            f.write(initial_response_str or "N/A")
-            f.write("\n\n========== 3. MCTS Prompt (First Success) ==========\n")
-            f.write(mcts_prompt_str or "N/A (Correct in initial phase or RAG fallback)")
-            f.write("\n\n========== 4. MCTS Response (First Success) ==========\n")
-            f.write(mcts_resp_str or "N/A")
-    except Exception:
-        logger.warning("Failed to write successful prompt trace for sample=%s path=%s", idx, file_path, exc_info=True)

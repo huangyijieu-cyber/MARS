@@ -8,8 +8,6 @@ from rdkit.Chem import AllChem, DataStructs, rdMolDescriptors
 from langchain_core.prompts import ChatPromptTemplate
 from prompt_engine import build_unified_mcts_prompt
 
-from evaluator import robust_standardize, get_inchikey_match
-
 logger = logging.getLogger(__name__)
 
 class MCTSNode:
@@ -34,7 +32,7 @@ class MCTSNode:
         return exploitation + exploration
 
 class MCTSEngine:
-    def __init__(self, llm, cfmid_adapter, target_formula, target_peaks, target_fp: List[int] = None, reference_smiles: List[str] = None, adduct="[M]+", top_k=5, true_smiles: str = "", search_mode: int = 3):
+    def __init__(self, llm, cfmid_adapter, target_formula, target_peaks, target_fp: List[int] = None, reference_smiles: List[str] = None, adduct="[M]+", top_k=5, search_mode: int = 3):
         self.llm = llm
         self.cfmid = cfmid_adapter
         self.target_formula = target_formula
@@ -44,11 +42,6 @@ class MCTSEngine:
         self.adduct = adduct
         self.top_k = top_k
         self.search_mode = search_mode 
-        
-        self.true_smiles = true_smiles
-        self.std_true_smiles = robust_standardize(true_smiles) if true_smiles else ""
-        self.successful_mcts_prompt = None
-        self.successful_mcts_response = None
         
         self.total_llm_proposals = 0
         self.valid_formula_proposals = 0
@@ -74,7 +67,6 @@ class MCTSEngine:
                 logger.warning("Failed to build target fingerprint bit vector", exc_info=True)
 
         self.visited_states: Dict[str, Dict[str, Any]] = {}
-        self.solver_llm = self.llm.bind(temperature=0.7) 
         
         if self.search_mode == 1:
             from prompt_engine import build_mcts_baseline1_prompt
@@ -343,14 +335,6 @@ class MCTSEngine:
                     if self._validate_formula(new_smiles, strict_h=True):
                         self.valid_formula_proposals += 1
                     
-                    if self.std_true_smiles and self.successful_mcts_prompt is None:
-                        std_new = robust_standardize(new_smiles)
-                        if std_new:
-                            is_match = (std_new == self.std_true_smiles) or get_inchikey_match(std_new, self.std_true_smiles)
-                            if is_match:
-                                self.successful_mcts_prompt = msg.to_string() 
-                                self.successful_mcts_response = text          
-
                     mol = Chem.MolFromSmiles(new_smiles)
                     if mol is not None:
                         c_new = self._canonize(new_smiles)

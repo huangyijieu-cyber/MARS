@@ -6,24 +6,23 @@ import os
 import shutil
 import logging
 from typing import List, Tuple, Dict, Any
-from config import INSTANCE_ID, POOL_DIR_BASE
 
 CURRENT_WORKER_ID = None 
 logger = logging.getLogger(__name__)
 
 
-def _validate_instance_id():
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", INSTANCE_ID):
+def _validate_instance_id(instance_id):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", instance_id):
         raise ValueError(
             "INSTANCE_ID must contain only letters, numbers, dots, underscores, or hyphens. "
-            f"Got: {INSTANCE_ID!r}"
+            f"Got: {instance_id!r}"
         )
 
 
-def _pool_container_names() -> List[str]:
-    _validate_instance_id()
+def _pool_container_names(instance_id) -> List[str]:
+    _validate_instance_id(instance_id)
     result = subprocess.run(
-        ["docker", "ps", "-a", "-q", "--filter", f"name=cfmid_worker_{INSTANCE_ID}_"],
+        ["docker", "ps", "-a", "-q", "--filter", f"name=cfmid_worker_{instance_id}_"],
         capture_output=True,
         text=True,
         check=True,
@@ -31,15 +30,16 @@ def _pool_container_names() -> List[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def _remove_pool_containers():
-    containers = _pool_container_names()
+def _remove_pool_containers(instance_id):
+    containers = _pool_container_names(instance_id)
     if not containers:
         return
     subprocess.run(["docker", "rm", "-f", *containers], check=True, stderr=subprocess.DEVNULL)
 
 class CFMIDAdapter:
-    def __init__(self, docker_image="wishartlab/cfmid:latest"):
+    def __init__(self, docker_image="wishartlab/cfmid:latest", instance_id="default"):
         self.docker_image = docker_image
+        self.instance_id = instance_id
         self.spectrum_cache: Dict[str, List[Dict[str, Any]]] = {} 
         
         base_path = "/trained_models_cfmid4.0/cfmid4"
@@ -64,10 +64,10 @@ class CFMIDAdapter:
         self.has_timeout = False
 
     @staticmethod
-    def prepare_pool(num_workers, cpus, mem, base_dir, image):
-        _validate_instance_id()
-        pool_dir = os.path.join(base_dir, INSTANCE_ID)
-        print(f"🚀 Initializing Docker Pool for Instance '{INSTANCE_ID}' ({num_workers} containers)...")
+    def prepare_pool(num_workers, cpus, mem, base_dir, image, instance_id="default"):
+        _validate_instance_id(instance_id)
+        pool_dir = os.path.join(base_dir, instance_id)
+        print(f"🚀 Initializing Docker Pool for Instance '{instance_id}' ({num_workers} containers)...")
         
         if os.path.exists(pool_dir):
             try:
@@ -77,7 +77,7 @@ class CFMIDAdapter:
                 raise
         os.makedirs(pool_dir, exist_ok=True)
         
-        _remove_pool_containers()
+        _remove_pool_containers(instance_id)
 
         for i in range(num_workers):
             worker_dir = os.path.join(pool_dir, f"w_{i}")
@@ -85,7 +85,7 @@ class CFMIDAdapter:
             os.makedirs(worker_dir, exist_ok=True)
             os.makedirs(worker_tmp_dir, exist_ok=True)
             
-            container_name = f"cfmid_worker_{INSTANCE_ID}_{i}"
+            container_name = f"cfmid_worker_{instance_id}_{i}"
             
             cmd = [
                 "docker", "run", "-d",
@@ -98,23 +98,23 @@ class CFMIDAdapter:
                 "sleep", "infinity"
             ]
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-        print(f"✅ Docker Pool '{INSTANCE_ID}' Ready.")
+        print(f"✅ Docker Pool '{instance_id}' Ready.")
 
     @staticmethod
-    def cleanup_pool():
-        print(f"🧹 Cleaning up Docker Pool for '{INSTANCE_ID}'...")
+    def cleanup_pool(instance_id="default"):
+        print(f"🧹 Cleaning up Docker Pool for '{instance_id}'...")
         try:
-            _remove_pool_containers()
+            _remove_pool_containers(instance_id)
         except Exception:
-            logger.exception("Failed to clean up CFM-ID Docker pool for INSTANCE_ID=%r", INSTANCE_ID)
+            logger.exception("Failed to clean up CFM-ID Docker pool for INSTANCE_ID=%r", instance_id)
 
     def reset_status(self):
         self.has_timeout = False
 
     def _get_container_name(self):
         if CURRENT_WORKER_ID is None:
-             return f"cfmid_worker_{INSTANCE_ID}_0"
-        return f"cfmid_worker_{INSTANCE_ID}_{CURRENT_WORKER_ID}"
+             return f"cfmid_worker_{self.instance_id}_0"
+        return f"cfmid_worker_{self.instance_id}_{CURRENT_WORKER_ID}"
 
     def _parse_cfmid_output(self, output_str: str) -> List[Tuple[float, float]]:
         peaks_dict = {}

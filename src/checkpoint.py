@@ -55,14 +55,14 @@ def load_checkpoint(output_file_path, tasks, logger):
 
     if not os.path.exists(output_file_path):
         print("-> No checkpoint found. Starting fresh.")
-        return tasks, metrics, finished_indices
+        return tasks, metrics
 
     try:
         print(f"Checking for existing checkpoint: {output_file_path}")
         existing_df = pd.read_csv(output_file_path)
         if existing_df.empty or "index" not in existing_df.columns:
             print("-> Checkpoint empty or invalid. Starting fresh.")
-            return tasks, metrics, finished_indices
+            return tasks, metrics
 
         finished_indices = set(existing_df["index"].astype(int).unique())
         print(f"-> Found {len(finished_indices)} finished samples.")
@@ -73,11 +73,11 @@ def load_checkpoint(output_file_path, tasks, logger):
         original_len = len(tasks)
         remaining_tasks = [t for t in tasks if t["index"] not in finished_indices]
         print(f"-> Resuming execution. Remaining tasks: {len(remaining_tasks)} / {original_len}")
-        return remaining_tasks, metrics, finished_indices
+        return remaining_tasks, metrics
 
     except Exception:
         logger.exception("Error reading checkpoint; starting fresh from %s", output_file_path)
-        return tasks, metrics, finished_indices
+        return tasks, metrics
 
 
 def append_result(output_file_path, result):

@@ -10,25 +10,17 @@ from tqdm import tqdm
 
 from cfmid_adapter import CFMIDAdapter
 from checkpoint import append_result, load_checkpoint, summarize_final_results
-from config import (
-    DOCKER_CPUS,
-    DOCKER_MEM,
-    MAX_TEST_SAMPLES,
-    OUTPUT_FILE_PATH,
-    POOL_DIR_BASE,
-    PWORKERS,
-    TEST_FILE_PATH,
-)
 from data_loader import MolecularDataLoader
 from worker import init_worker, process_single_sample
 
 logger = logging.getLogger(__name__)
 global_executor = None
+active_config = None
 
 
-def setup_logging():
+def setup_logging(log_level="INFO"):
     logging.basicConfig(
-        level=os.getenv("MARS_LOG_LEVEL", "INFO").upper(),
+        level=str(log_level).upper(),
         format="%(asctime)s %(levelname)s [%(processName)s] %(name)s: %(message)s",
     )
 
@@ -64,7 +56,8 @@ def signal_handler(signum, frame):
             logger.warning("Executor does not support cancel_futures; falling back to shutdown(wait=False)")
             global_executor.shutdown(wait=False)
 
-    CFMIDAdapter.cleanup_pool()
+    if active_config:
+        CFMIDAdapter.cleanup_pool(active_config.docker.instance_id)
     kill_all_children()
     os._exit(1)
 
@@ -116,37 +109,38 @@ def build_tasks(df):
     return tasks
 
 
-def run_experiment(search_mode=3):
-    global global_executor
+def run_experiment(config):
+    global global_executor, active_config
+    active_config = config
 
-    os.makedirs("data/prompt", exist_ok=True)
-    output_dir = os.path.dirname(OUTPUT_FILE_PATH)
+    output_dir = os.path.dirname(config.paths.output_file_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
     loader = MolecularDataLoader()
-    df = loader.load_test_data(TEST_FILE_PATH, limit=MAX_TEST_SAMPLES)
+    df = loader.load_test_data(config.paths.test_file_path, limit=config.run.max_test_samples)
     tasks = build_tasks(df)
 
-    tasks, running_metrics, _ = load_checkpoint(OUTPUT_FILE_PATH, tasks, logger)
+    tasks, running_metrics = load_checkpoint(config.paths.output_file_path, tasks, logger)
     if not tasks:
         print("All tasks completed.")
         return
 
-    max_workers = PWORKERS
-    print(f"Starting execution with {max_workers} workers (Mode: {search_mode})...")
+    max_workers = config.run.pworkers
+    print(f"Starting execution with {max_workers} workers (Mode: {config.run.search_mode})...")
 
     try:
         CFMIDAdapter.prepare_pool(
             num_workers=max_workers,
-            cpus=DOCKER_CPUS,
-            mem=DOCKER_MEM,
-            base_dir=POOL_DIR_BASE,
-            image="wishartlab/cfmid:latest",
+            cpus=config.docker.cpus,
+            mem=config.docker.mem,
+            base_dir=config.docker.pool_dir_base,
+            image=config.docker.image,
+            instance_id=config.docker.instance_id,
         )
     except Exception as e:
         print(f"FATAL: Failed to initialize Docker pool: {e}")
-        CFMIDAdapter.cleanup_pool()
+        CFMIDAdapter.cleanup_pool(config.docker.instance_id)
         return
 
     manager = None
@@ -157,14 +151,14 @@ def run_experiment(search_mode=3):
             id_queue.put(i)
     except Exception as e:
         print(f"FATAL: Failed to create Manager Queue: {e}")
-        CFMIDAdapter.cleanup_pool()
+        CFMIDAdapter.cleanup_pool(config.docker.instance_id)
         return
 
     try:
         with ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=init_worker,
-            initargs=(id_queue, search_mode),
+            initargs=(id_queue, config),
         ) as pool:
             global_executor = pool
             future_to_idx = {pool.submit(process_single_sample, t): t["index"] for t in tasks}
@@ -186,7 +180,7 @@ def run_experiment(search_mode=3):
                 if not res:
                     continue
 
-                append_result(OUTPUT_FILE_PATH, res)
+                append_result(config.paths.output_file_path, res)
                 running_metrics.update_from_result(res)
                 averages = running_metrics.averages()
 
@@ -202,11 +196,11 @@ def run_experiment(search_mode=3):
     finally:
         print("Cleaning up resources...")
         global_executor = None
-        CFMIDAdapter.cleanup_pool()
+        CFMIDAdapter.cleanup_pool(config.docker.instance_id)
         if manager:
             try:
                 manager.shutdown()
             except Exception:
                 logger.exception("Failed to shut down multiprocessing manager")
 
-    summarize_final_results(OUTPUT_FILE_PATH, search_mode, logger)
+    summarize_final_results(config.paths.output_file_path, config.run.search_mode, logger)
