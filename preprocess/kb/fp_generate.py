@@ -1,9 +1,16 @@
 import pandas as pd
 import json
+import logging
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdMolDescriptors
 import selfies as sf
 from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 INPUT_RAW_DATA = "data/molecules/candidate_pools/MassSpecGym_retrieval_molecules_4M.tsv"
 OUTPUT_CLEANED_DATA = "data/raw_kb.tsv"
@@ -33,11 +40,12 @@ def process_molecule(row):
         
         try:
             result['selfies'] = sf.encoder(smiles)
-        except:
+        except Exception:
+            logger.debug("SELFIES encoding failed for smiles=%r", smiles, exc_info=True)
             result['selfies'] = ""
             
     except Exception as e:
-        pass
+        logger.warning("Failed to process molecule smiles=%r inchikey=%r", smiles, inchikey, exc_info=True)
         
     return result
 

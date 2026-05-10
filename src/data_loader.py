@@ -3,6 +3,9 @@ import numpy as np
 import json
 import ast
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MolecularDataLoader:
     def __init__(self):
@@ -12,10 +15,12 @@ class MolecularDataLoader:
         if isinstance(val, str):
             try:
                 return json.loads(val)
-            except:
+            except Exception:
+                logger.debug("JSON list parse failed; trying literal_eval. value=%r", val, exc_info=True)
                 try:
                     return ast.literal_eval(val)
-                except:
+                except Exception:
+                    logger.warning("Failed to parse list-like value: %r", val, exc_info=True)
                     return []
         return val if isinstance(val, list) else []
 

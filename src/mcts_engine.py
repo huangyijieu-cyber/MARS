@@ -1,6 +1,7 @@
 import math
 import json
 import re
+import logging
 from typing import List, Tuple, Dict, Any, Optional
 from rdkit import Chem
 from rdkit.Chem import AllChem, DataStructs, rdMolDescriptors
@@ -8,6 +9,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from prompt_engine import build_unified_mcts_prompt
 
 from evaluator import robust_standardize, get_inchikey_match
+
+logger = logging.getLogger(__name__)
 
 class MCTSNode:
     def __init__(self, smiles: str, parent=None):
@@ -58,7 +61,8 @@ class MCTSEngine:
                     peaks = self.cfmid.predict_spectrum(ref_smi, adduct=self.adduct)
                     if peaks:
                         self.ref_spectra_cache.append({"smiles": ref_smi, "peaks": peaks})
-                except: pass
+                except Exception:
+                    logger.warning("Failed to cache reference spectrum for smiles=%r", ref_smi, exc_info=True)
 
         self.target_fp_bv = None
         if self.target_fp_list:
@@ -66,7 +70,8 @@ class MCTSEngine:
                 self.target_fp_bv = DataStructs.ExplicitBitVect(4096)
                 for i, enumerate_bit in enumerate(self.target_fp_list):
                     if enumerate_bit > 0: self.target_fp_bv.SetBit(i)
-            except: pass
+            except Exception:
+                logger.warning("Failed to build target fingerprint bit vector", exc_info=True)
 
         self.visited_states: Dict[str, Dict[str, Any]] = {}
         self.solver_llm = self.llm.bind(temperature=0.7) 
@@ -84,8 +89,14 @@ class MCTSEngine:
 
     def _canonize(self, smiles):
         if not smiles: return ""
-        try: return Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=True, isomericSmiles=False)
-        except: return ""
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if not mol:
+                return ""
+            return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+        except Exception:
+            logger.debug("Failed to canonicalize smiles=%r", smiles, exc_info=True)
+            return ""
 
     def _parse_formula_to_dict(self, formula):
         if not formula: return {}
@@ -107,7 +118,9 @@ class MCTSEngine:
                 target_counts.pop('H', None)
                 calc_counts.pop('H', None)
             return target_counts == calc_counts
-        except: return False
+        except Exception:
+            logger.debug("Formula validation failed for smiles=%r target_formula=%s", smiles, self.target_formula, exc_info=True)
+            return False
 
     def _compute_formula_score(self, smiles):
         if not smiles: return 0.0
@@ -131,7 +144,8 @@ class MCTSEngine:
             
             score = 1.0 / (1.0 + total_diff)
             return score
-        except:
+        except Exception:
+            logger.debug("Formula score calculation failed for smiles=%r target_formula=%s", smiles, self.target_formula, exc_info=True)
             return 0.0
 
     def _calculate_hybrid_reward(self, smiles: str, pred_peaks_dicts: List[Dict[str, Any]]) -> float:
@@ -148,7 +162,8 @@ class MCTSEngine:
                 if mol:
                     cand = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=4096)
                     fp_score = DataStructs.TanimotoSimilarity(cand, self.target_fp_bv)
-            except: pass
+            except Exception:
+                logger.warning("Failed to compute fingerprint reward for smiles=%r", smiles, exc_info=True)
         else:
             fp_score = spec_score 
 
@@ -347,7 +362,15 @@ class MCTSEngine:
                             children.append(child)
                             found_valid = True
                 if found_valid: break
-            except: continue
+            except Exception:
+                logger.warning(
+                    "MCTS expansion failed for node=%r attempt=%s/%s",
+                    node.smiles,
+                    attempt + 1,
+                    max_llm_retries,
+                    exc_info=True,
+                )
+                continue
 
         node.is_expanded = True
         return children

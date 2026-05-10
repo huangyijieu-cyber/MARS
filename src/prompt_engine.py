@@ -1,8 +1,11 @@
 from langchain_core.prompts import ChatPromptTemplate
 import numpy as np
+import logging
 from rdkit import Chem 
 from rdkit.Chem import AllChem
 from fingerprint_utils import explain_shared_bits 
+
+logger = logging.getLogger(__name__)
 
 def get_top_peaks_string(peaks_list, top_k=5):
     if not peaks_list: return "N/A"
@@ -11,23 +14,25 @@ def get_top_peaks_string(peaks_list, top_k=5):
         sorted_peaks = sorted(cleaned_peaks, key=lambda x: x[1], reverse=True)
         formatted_peaks = [f"{p[0]:.1f} ({p[1]:.1f}%)" for p in sorted_peaks[:top_k]]
         return ", ".join(formatted_peaks)
-    except: return str(peaks_list)
+    except Exception:
+        logger.warning("Failed to format target peaks; falling back to raw string: %r", peaks_list, exc_info=True)
+        return str(peaks_list)
 
 def build_molrag_prompt(top_k=10):
     template = """
 Role Definition:
 You are an expert in mass spectrometry interpretation and chemical structure reconstruction. Your task is to deduce the most probable
-target molecular structure based on reference molecules (References) and a target molecular formula ({Target Formula}),
+target molecular structure based on reference molecules (References) and a target molecular formula ({target_formula}),
 and convert it into a SMILES sequence.
 I. Core Task:
 The system provides reference molecules retrieved based on spectral similarity. You need to adopt different inference strategies to
 construct the target molecule depending on the Similarity Score of the reference molecules.
 II. Task Input:
 1. Reference Molecules (References):
-{Context}
-2. Target Molecular Formula: {Target Formula}
+{context}
+2. Target Molecular Formula: {target_formula}
 3. Target Mass Spectrum Key Peaks (Target Top Peaks m/z), peaks given in the format m/z (relative intensity %):
-{Target Peaks}
+{target_top_peaks}
 III. Chain-of-Thought (CoT) Guidelines
 Please strictly follow the steps below for your deduction STEP BY STEP:
 Step 1: Reference Evaluation and Strategy Selection
@@ -49,32 +54,30 @@ of the reference molecules!!!
 [Case B: Lack of Credible References (All molecules with Similarity < 0.6)]
 - 1. Abandon the scaffold: The value of the reference molecules is extremely low; treat their Shared Substructures only as potential
 fragment hints (not as a fixed scaffold).
-- 2. De Novo Inference: You must rely primarily on the {Target Formula} and Target Top Peaks (m/z) for inference.
+- 2. De Novo Inference: You must rely primarily on the {target_formula} and Target Top Peaks (m/z) for inference.
 - 3. Basis:
-– Calculate the Degree of Unsaturation (DoU) of the {Target Formula}.
+– Calculate the Degree of Unsaturation (DoU) of the {target_formula}.
 – Use Target Top Peaks (m/z) for fragment inference: Analyze the correspondence between strong peaks m/z and common
 fragment ions (e.g., 91→benzyl, 77→phenyl, 43→acetyl/propyl, 57→butyl, 29→ethyl); Check for reasonable Neutral
 Loss (e.g., M-18 dehydration, M-15 demethylation).
 – Construct several candidate isomers that fit the molecular formula and can explain the main fragments.
 - 4. Skip the gap analysis directly and proceed to “Step 3” for structure reconstruction.
 Step 2: Atom Gap and Unsaturation Analysis (Gap Analysis) — Only applicable to [Case A]
-- 1. Calculate Atom Difference: {Target Formula} - Core Scaffold Formula = Remaining Atoms.
+- 1. Calculate Atom Difference: {target_formula} - Core Scaffold Formula = Remaining Atoms.
 - 2. Calculate Unsaturation Difference (DoU Diff): Decrease in H (May indicate formation of double-bonds, rings, or introduction
 of C=O); Increase in H (May indicate double-bond reduction or ring opening).
 - 3. Key Decision: Judge the form in which the remaining atoms exist to match the substitution sites of the scaffold based on
 Shared Substructures and Target Top Peaks.
 Step 3: Structure Reconstruction & Validation
 - 1. Execute Construction: If [Case A]: Add deduced side chains or functional groups to reasonable positions on the core scaffold.
-If [Case B]: Combine deduced functional groups and carbon chains to generate a reasonable molecule that fits the {Target
-Formula}.
+If [Case B]: Combine deduced functional groups and carbon chains to generate a reasonable molecule that fits the target formula.
 - 2. Chemical Rationality Check: Ensure the constructed molecule is chemically stable under standard conditions; Prioritize stable
 functional group combinations common in nature or synthetic chemistry.
-- 3. Self-Correction — The most important step: Atom Count (Strictly match the element types and quantities of the {Target
-Formula}); Syntax Check (Ensure the output SMILES sequence is syntactically closed and valid); Valence Check.
+- 3. Self-Correction — The most important step: Atom Count (Strictly match the element types and quantities of the target formula); Syntax Check (Ensure the output SMILES sequence is syntactically closed and valid); Valence Check.
 IV. Output Requirements
 1. Please output the Reasoning first following the CoT order. In the Reasoning, explicitly state whether you fall under [Case A] or
 [Case B] and proceed with the deduction accordingly.
-2. Output the final result in JSON format. The result list should contain {Top K} candidate SMILES, sorted from high to low
+2. Output the final result in JSON format. The result list should contain {top_k} candidate SMILES, sorted from high to low
 compliance, with the sequence best fitting the task requirements ranked first.
 Reasoning:
 Please strictly follow the provided CoT output reasoning process.
@@ -99,8 +102,8 @@ The system provides a diagnostic report based on the target spectrum and the pre
 to adopt different inference strategies based on the discrepancies between the two spectra to modify or reconstruct the current
 molecule.
 II. Task Inputs:
-1. Target Formula: {Target Formula} (The exact atomic composition you must strictly match)
-2. Current Structure: {Current SMILES} (The molecule you generated in the previous step)
+1. Target Formula: {formula} (The exact atomic composition you must strictly match)
+2. Current Structure: {smiles} (The molecule you generated in the previous step)
 3. Spectral Discrepancy (Diagnosis):
 This section compares the Target Spectrum (Ground-Truth) vs. Predicted Spectrum (Current Structure).
 - MATCHED: Peaks present in both. The SMILES shown is the fragment structure generated by the current molecule. (Action:
@@ -109,15 +112,15 @@ Preserve these substructures)
 Modify the molecule to REMOVE this fragment.)
 - MISSING: Peaks present ONLY in the Target. (Action: You need to ADD a substructure that produces this mass.)
 [Detailed Report]:
-{Diagnostic Report}
+{spectrum_comparison}
 4. Reference Knowledge Hints (From RAG):
 (Structural clues retrieved from external database based on mass similarity)
-{Reference Hints}
+{reference_hints}
 (CRITICAL: If a reference molecule has a peak we are missing, try to borrow its substructure!)
 III. Chain-of-Thought (CoT) Guidelines:
 Please strictly follow the steps below for your deduction STEP BY STEP:
 Step 1: Fundamental Analysis
-- 1. Calculate Degree of Unsaturation (DoU) for the {Formula}.
+- 1. Calculate Degree of Unsaturation (DoU) for the {formula}.
 - 2. Check if the Current Structure matches this DoU. If not, ring/double-bond adjustment is mandatory.
 Step 2: Strategy Selection (Case Decision)
 - Evaluate the severity of the Spectral Discrepancy:
@@ -129,7 +132,7 @@ ring size) that explains the missing major fragments.
 Step 3: Fragment Mapping & Execution
 - 1. Map the “Missing Peaks” (m/z) to specific substructures (e.g., 91→Benzyl, 77→Phenyl, 43→Acetyl).
 - 2. Apply the modification determined in Step 2.
-- FINAL CHECK: Count atoms. The output SMILES MUST have exactly {Formula}.
+- FINAL CHECK: Count atoms. The output SMILES MUST have exactly {formula}.
 IV. Output Requirements:
 1. Reasoning: Explicitly state “Decision: Case A” or “Decision: Case B”, then explain your chemical logic.
 2. Final Answer: A JSON object containing the SINGLE BEST modified SMILES string.
@@ -168,8 +171,8 @@ def format_docs_for_context(docs, target_fp_array=None):
                     frags = explain_shared_bits(mol, shared_bits)
                     if frags:
                         shared_substructures_str = ", ".join(list(set(frags)))
-            except Exception as e:
-                pass
+            except Exception:
+                logger.warning("Failed to explain shared fingerprint bits for doc=%s smiles=%r", i + 1, smiles, exc_info=True)
         
         formatted_str += (
             f"Reference {i+1} (Similarity: {score:.4f}):\n" 

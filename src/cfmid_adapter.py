@@ -4,10 +4,38 @@ import math
 import time
 import os
 import shutil
+import logging
 from typing import List, Tuple, Dict, Any
 from config import INSTANCE_ID, POOL_DIR_BASE
 
 CURRENT_WORKER_ID = None 
+logger = logging.getLogger(__name__)
+
+
+def _validate_instance_id():
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", INSTANCE_ID):
+        raise ValueError(
+            "INSTANCE_ID must contain only letters, numbers, dots, underscores, or hyphens. "
+            f"Got: {INSTANCE_ID!r}"
+        )
+
+
+def _pool_container_names() -> List[str]:
+    _validate_instance_id()
+    result = subprocess.run(
+        ["docker", "ps", "-a", "-q", "--filter", f"name=cfmid_worker_{INSTANCE_ID}_"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _remove_pool_containers():
+    containers = _pool_container_names()
+    if not containers:
+        return
+    subprocess.run(["docker", "rm", "-f", *containers], check=True, stderr=subprocess.DEVNULL)
 
 class CFMIDAdapter:
     def __init__(self, docker_image="wishartlab/cfmid:latest"):
@@ -37,15 +65,19 @@ class CFMIDAdapter:
 
     @staticmethod
     def prepare_pool(num_workers, cpus, mem, base_dir, image):
+        _validate_instance_id()
         pool_dir = os.path.join(base_dir, INSTANCE_ID)
         print(f"🚀 Initializing Docker Pool for Instance '{INSTANCE_ID}' ({num_workers} containers)...")
         
         if os.path.exists(pool_dir):
-            try: shutil.rmtree(pool_dir)
-            except: pass
+            try:
+                shutil.rmtree(pool_dir)
+            except Exception:
+                logger.exception("Failed to remove existing CFM-ID pool directory: %s", pool_dir)
+                raise
         os.makedirs(pool_dir, exist_ok=True)
         
-        subprocess.run(f"docker rm -f $(docker ps -a -q --filter name=cfmid_worker_{INSTANCE_ID}_)", shell=True, stderr=subprocess.DEVNULL)
+        _remove_pool_containers()
 
         for i in range(num_workers):
             worker_dir = os.path.join(pool_dir, f"w_{i}")
@@ -71,7 +103,10 @@ class CFMIDAdapter:
     @staticmethod
     def cleanup_pool():
         print(f"🧹 Cleaning up Docker Pool for '{INSTANCE_ID}'...")
-        subprocess.run(f"docker rm -f $(docker ps -a -q --filter name=cfmid_worker_{INSTANCE_ID}_)", shell=True, stderr=subprocess.DEVNULL)
+        try:
+            _remove_pool_containers()
+        except Exception:
+            logger.exception("Failed to clean up CFM-ID Docker pool for INSTANCE_ID=%r", INSTANCE_ID)
 
     def reset_status(self):
         self.has_timeout = False
@@ -96,7 +131,9 @@ class CFMIDAdapter:
                     mz_key = round(mz, 4) 
                     if mz_key not in peaks_dict or inten > peaks_dict[mz_key]:
                         peaks_dict[mz_key] = inten
-            except: continue
+            except Exception:
+                logger.debug("Skipping malformed CFM-ID output line: %r", line, exc_info=True)
+                continue
         return [(mz, inten) for mz, inten in peaks_dict.items()]
 
     def _generate_fraggraph(self, smiles: str, ionization_mode: str = "+") -> Dict[float, str]:
@@ -140,9 +177,16 @@ class CFMIDAdapter:
                         frag_smiles = parts[2]
                         if mass not in fragment_map or len(frag_smiles) > len(fragment_map[mass]):
                             fragment_map[mass] = frag_smiles
-                    except: continue
+                    except Exception:
+                        logger.debug("Skipping malformed fraggraph line: %r", line, exc_info=True)
+                        continue
                     
         except Exception:
+            logger.exception(
+                "Failed to generate fraggraph for smiles=%r in container=%s",
+                smiles,
+                container_name,
+            )
             return {}
                 
         return fragment_map
@@ -192,7 +236,13 @@ class CFMIDAdapter:
                 print(f"\n[CFM-ID Timeout] Worker: {self._get_container_name()}")
                 continue 
             except Exception as e: 
-                print(f"\n[CFM-ID Unknown Error] {e}")
+                logger.exception(
+                    "Unknown CFM-ID prediction error for smiles=%r adduct=%s attempt=%s/%s",
+                    smiles,
+                    adduct,
+                    attempt + 1,
+                    retries,
+                )
                 time.sleep(0.5)
                 continue
             
@@ -204,7 +254,9 @@ class CFMIDAdapter:
 
         try:
             max_int = max([p[1] for p in raw_peaks])
-        except ValueError: return []
+        except ValueError:
+            logger.warning("CFM-ID returned no usable positive intensities for smiles=%r adduct=%s", smiles, adduct)
+            return []
 
         if max_int <= 0: return []
         
