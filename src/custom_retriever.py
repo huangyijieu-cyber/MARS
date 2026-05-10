@@ -5,11 +5,14 @@ import json
 import os
 import re
 import pickle
+import logging
 from collections import defaultdict
 from typing import List, Any, Dict, Set
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.documents import Document
 from rdkit import Chem 
+
+logger = logging.getLogger(__name__)
 
 class FaissDiceRetriever(BaseRetriever):
     packed_data: Any
@@ -150,7 +153,7 @@ class FaissDiceRetriever(BaseRetriever):
             return docs
             
         except Exception as e:
-            print(f"Subset search error: {e}")
+            logger.exception("Subset search failed for tier=%s limit=%s candidates=%s", tier_name, limit, len(candidate_indices))
             return []
 
     def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
@@ -158,7 +161,9 @@ class FaissDiceRetriever(BaseRetriever):
             input_data = json.loads(query)
             target_fp_list = input_data.get("fps", [])
             target_formula = input_data.get("formula", "")
-        except: return []
+        except Exception:
+            logger.warning("Failed to parse retriever query: %r", query, exc_info=True)
+            return []
 
         target_counts = self._parse_formula_counts(target_formula)
         target_keys = set(target_counts.keys())
@@ -256,6 +261,6 @@ class FaissDiceRetriever(BaseRetriever):
                 final_results.extend(tier5_docs)
                 
             except Exception as e:
-                print(f"Global fallback error: {e}")
+                logger.exception("Global fallback retrieval failed for formula=%s", target_formula)
 
         return final_results[:self.k]

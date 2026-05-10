@@ -3,10 +3,17 @@ import numpy as np
 import json
 import os
 import gc
+import logging
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from rdkit import Chem
+
+logging.basicConfig(
+    level=os.getenv("MARS_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 INPUT_TSV = "data/raw_kb.tsv"
 OUTPUT_DIR = "data/faiss_kb"
@@ -26,8 +33,8 @@ def get_2d_inchikey(smiles):
             inchikey = Chem.MolToInchiKey(mol)
             if inchikey:
                 return inchikey.split('-')[0]
-    except:
-        pass
+    except Exception:
+        logger.debug("Failed to compute 2D InChIKey for smiles=%r", smiles, exc_info=True)
     return None
 
 def build_blacklist_from_targets(*target_files):
@@ -66,7 +73,8 @@ def process_chunk(chunk_df, fps_col):
                 vec = val
             temp_matrix[i, :] = vec
             valid_indices.append(i)
-        except:
+        except Exception:
+            logger.debug("Skipping malformed fingerprint row index=%s value=%r", i, val, exc_info=True)
             continue
 
     if len(valid_indices) < n:
@@ -101,8 +109,8 @@ def generate_faiss_assets():
 
     try:
         reader = pd.read_csv(INPUT_TSV, sep='\t', chunksize=CHUNK_SIZE, engine='pyarrow')
-    except:
-        print("PyArrow chunking failed, falling back to default engine...")
+    except Exception:
+        logger.warning("PyArrow chunking failed, falling back to default pandas engine.", exc_info=True)
         reader = pd.read_csv(INPUT_TSV, sep='\t', chunksize=CHUNK_SIZE)
 
     total_processed = 0

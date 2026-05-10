@@ -23,6 +23,7 @@ import signal
 import psutil
 import subprocess
 import time
+import logging
 
 from config import *
 from data_loader import MolecularDataLoader
@@ -38,6 +39,11 @@ from evaluator import MolecularEvaluator, robust_standardize, get_inchikey_match
 
 worker_resources = {}
 global_executor = None
+logging.basicConfig(
+    level=os.getenv("MARS_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(processName)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 def init_worker(worker_id_queue):
     import os
@@ -49,7 +55,7 @@ def init_worker(worker_id_queue):
         worker_id = worker_id_queue.get(timeout=10)
         cfmid_adapter.CURRENT_WORKER_ID = worker_id
     except Exception as e:
-        print(f"[Worker {os.getpid()}] FATAL: Failed to assign Worker ID: {e}")
+        logger.exception("[Worker %s] FATAL: Failed to assign Worker ID", os.getpid())
         raise RuntimeError(f"Worker {os.getpid()} could not get an ID.")
 
     faiss.omp_set_num_threads(1)
@@ -186,6 +192,14 @@ def process_single_sample(row_data):
                     initial_candidates = valid_batch[:TOP_K]
                     break
             except Exception:
+                logger.warning(
+                    "Initial LLM generation failed for sample=%s formula=%s attempt=%s/%s",
+                    idx,
+                    target_formula,
+                    attempt + 1,
+                    max_init_retries,
+                    exc_info=True,
+                )
                 time.sleep(1)
                 continue
 
@@ -228,7 +242,7 @@ def process_single_sample(row_data):
                                 is_initialized = True
                                 mcts_status = "Fallback to RAG"
                         except Exception:
-                            pass
+                            logger.warning("RAG fallback initialization failed for sample=%s", idx, exc_info=True)
 
                 if is_initialized:
                     mcts_engine.search(n_iterations=MCTS_ITERATIONS)
@@ -252,6 +266,7 @@ def process_single_sample(row_data):
                     mcts_status = "Failed (Init & Fallback)"
 
             except Exception as e:
+                logger.exception("MCTS failed for sample=%s formula=%s", idx, target_formula)
                 mcts_status = f"Error: {str(e)}"
         else:
             if not initial_candidates:
@@ -287,8 +302,8 @@ def process_single_sample(row_data):
                     f.write(mcts_prompt_str or "N/A (Correct in initial phase or RAG fallback)")
                     f.write("\n\n========== 4. MCTS Response (First Success) ==========\n")
                     f.write(mcts_resp_str or "N/A")
-            except Exception as e:
-                pass
+            except Exception:
+                logger.warning("Failed to write successful prompt trace for sample=%s path=%s", idx, file_path, exc_info=True)
 
         metrics = mcts_engine.get_search_metrics() if mcts_engine else {"valid_node_rate": 0.0, "avg_reward_delta": 0.0}
 
@@ -313,6 +328,7 @@ def process_single_sample(row_data):
         return result_record
 
     except Exception as e:
+        logger.exception("Unhandled error in sample=%s", idx)
         tqdm.write(f"Error in sample {idx}: {e}")
         return None
 
@@ -322,19 +338,29 @@ def kill_all_children():
         children = parent.children(recursive=True)
         if children:
             for child in children:
-                try: child.kill()
-                except: pass
+                try:
+                    child.kill()
+                except Exception:
+                    logger.warning("Failed to kill child process pid=%s", child.pid, exc_info=True)
             _, alive = psutil.wait_procs(children, timeout=2)
-    except Exception: pass
+            if alive:
+                logger.warning("Some child processes did not exit after kill: %s", [p.pid for p in alive])
+    except Exception:
+        logger.exception("Failed while killing child processes")
 
 def signal_handler(signum, frame):
     global global_executor
     if global_executor:
-        try: global_executor.shutdown(wait=False, cancel_futures=True)
-        except: global_executor.shutdown(wait=False)
+        try:
+            global_executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            logger.warning("Executor does not support cancel_futures; falling back to shutdown(wait=False)")
+            global_executor.shutdown(wait=False)
 
-    try: CFMIDAdapter.cleanup_pool()
-    except: pass
+    try:
+        CFMIDAdapter.cleanup_pool()
+    except Exception:
+        logger.exception("Failed to clean up CFM-ID pool during signal handling")
 
     kill_all_children()
     os._exit(1)
@@ -362,8 +388,10 @@ def main():
         if raw_smi and isinstance(raw_smi, str):
             true_smi = raw_smi
         elif raw_sf and isinstance(raw_sf, str):
-            try: true_smi = sf.decoder(raw_sf)
-            except: pass
+            try:
+                true_smi = sf.decoder(raw_sf)
+            except Exception:
+                logger.warning("Failed to decode SELFIES for sample=%s", idx, exc_info=True)
 
         task = row.to_dict()
         task['index'] = idx
@@ -382,7 +410,8 @@ def main():
             for p in p_list:
                 try:
                     if float(p[1]) > 0: cleaned.append((float(p[0]), float(p[1])))
-                except: pass
+                except Exception:
+                    logger.warning("Skipping malformed peak for sample=%s peak=%r", idx, p, exc_info=True)
         task['target_peaks_cleaned'] = cleaned
         tasks.append(task)
 
@@ -472,7 +501,12 @@ def main():
             )
 
             for future in pbar:
-                res = future.result()
+                try:
+                    res = future.result()
+                except Exception:
+                    failed_idx = future_to_idx[future]
+                    logger.exception("Worker future failed for sample=%s", failed_idx)
+                    continue
                 if res:
                     single_df = pd.DataFrame([res])
                     header_needed = not os.path.exists(OUTPUT_FILE_PATH)
@@ -500,10 +534,14 @@ def main():
     finally:
         print("Cleaning up resources...")
         global_executor = None
-        try: CFMIDAdapter.cleanup_pool()
-        except: pass
-        try: m.shutdown()
-        except: pass
+        try:
+            CFMIDAdapter.cleanup_pool()
+        except Exception:
+            logger.exception("Failed to clean up CFM-ID pool")
+        try:
+            m.shutdown()
+        except Exception:
+            logger.exception("Failed to shut down multiprocessing manager")
 
     try:
         final_df = pd.read_csv(OUTPUT_FILE_PATH)

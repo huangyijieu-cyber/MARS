@@ -1,8 +1,11 @@
 from langchain_core.prompts import ChatPromptTemplate
 import numpy as np
+import logging
 from rdkit import Chem 
 from rdkit.Chem import AllChem
 from fingerprint_utils import explain_shared_bits 
+
+logger = logging.getLogger(__name__)
 
 def get_top_peaks_string(peaks_list, top_k=5):
     if not peaks_list: return "N/A"
@@ -11,7 +14,9 @@ def get_top_peaks_string(peaks_list, top_k=5):
         sorted_peaks = sorted(cleaned_peaks, key=lambda x: x[1], reverse=True)
         formatted_peaks = [f"{p[0]:.1f} ({p[1]:.1f}%)" for p in sorted_peaks[:top_k]]
         return ", ".join(formatted_peaks)
-    except: return str(peaks_list)
+    except Exception:
+        logger.warning("Failed to format target peaks; falling back to raw string: %r", peaks_list, exc_info=True)
+        return str(peaks_list)
 
 def build_molrag_prompt(top_k=10):
     template = """
@@ -166,8 +171,8 @@ def format_docs_for_context(docs, target_fp_array=None):
                     frags = explain_shared_bits(mol, shared_bits)
                     if frags:
                         shared_substructures_str = ", ".join(list(set(frags)))
-            except Exception as e:
-                pass
+            except Exception:
+                logger.warning("Failed to explain shared fingerprint bits for doc=%s smiles=%r", i + 1, smiles, exc_info=True)
         
         formatted_str += (
             f"Reference {i+1} (Similarity: {score:.4f}):\n" 

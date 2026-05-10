@@ -1,7 +1,10 @@
 import json
 import re
+import logging
 from evaluator import robust_standardize
 from rdkit import Chem
+
+logger = logging.getLogger(__name__)
 
 class MolecularPostProcessor:
     def __init__(self):
@@ -31,7 +34,8 @@ class MolecularPostProcessor:
 
             res = json.loads(candidate_str)
             return res if isinstance(res, list) else [str(res)]
-        except:
+        except Exception:
+            logger.warning("Failed to parse LLM output as JSON; falling back to quoted-string extraction.", exc_info=True)
             return re.findall(r'"([^"]+)"', candidate_str)
 
     def process_generations(self, generations_list, target_formula=None, **kwargs):

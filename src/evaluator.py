@@ -5,6 +5,9 @@ from rdkit.Chem.MolStandardize import rdMolStandardize
 import numpy as np
 from typing import List, Optional
 import pulp
+import logging
+
+logger = logging.getLogger(__name__)
 
 def robust_standardize(smiles: str, include_chirality: bool = False) -> str:
     if not smiles or not isinstance(smiles, str):
@@ -19,22 +22,23 @@ def robust_standardize(smiles: str, include_chirality: bool = False) -> str:
             lfc = rdMolStandardize.LargestFragmentChooser()
             mol = lfc.choose(mol)
         except Exception:
-            pass 
+            logger.debug("Largest-fragment standardization failed for smiles=%r", smiles, exc_info=True)
 
         try:
             uc = rdMolStandardize.Uncharger()
             mol = uc.uncharge(mol)
         except Exception:
-            pass
+            logger.debug("Uncharging failed for smiles=%r", smiles, exc_info=True)
 
         return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=include_chirality)
     except Exception:
+        logger.debug("Primary SMILES standardization failed for smiles=%r", smiles, exc_info=True)
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol:
                 return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=include_chirality)
-        except:
-            pass
+        except Exception:
+            logger.debug("Fallback SMILES standardization failed for smiles=%r", smiles, exc_info=True)
         return ""
 
 def get_inchikey_match(smiles1: str, smiles2: str) -> bool:
@@ -47,19 +51,25 @@ def get_inchikey_match(smiles1: str, smiles2: str) -> bool:
         key2 = Chem.MolToInchiKey(mol2)
         
         return key1.split('-')[0] == key2.split('-')[0]
-    except:
+    except Exception:
+        logger.debug("InChIKey comparison failed for smiles1=%r smiles2=%r", smiles1, smiles2, exc_info=True)
         return False
 
 class MyopicMCES():
     def __init__(
         self,
         ind: int = 0,
-        solver: str = pulp.listSolvers(onlyAvailable=True)[0],
+        solver: Optional[str] = None,
         threshold: int = 15,
         always_stronger_bound: bool = True,
         solver_options: dict = None
     ):
         self.ind = ind
+        if solver is None:
+            solvers = pulp.listSolvers(onlyAvailable=True)
+            if not solvers:
+                raise RuntimeError("No PuLP solver is available for MCES evaluation.")
+            solver = solvers[0]
         self.solver = solver
         self.threshold = threshold
         self.always_stronger_bound = always_stronger_bound
@@ -80,14 +90,19 @@ class MyopicMCES():
             )
             return float(result[1])
         except ImportError:
-            print("Error: myopic_mces module not found.")
+            logger.exception("myopic_mces module not found; returning fallback MCES distance.")
             return 100.0
         except Exception as e:
+            logger.exception("MCES calculation failed for smiles_1=%r smiles_2=%r", smiles_1, smiles_2)
             return 100.0 
 
 class MolecularEvaluator:
     def __init__(self, use_mces=True):
-        self.mces_calculator = MyopicMCES() if use_mces else None
+        try:
+            self.mces_calculator = MyopicMCES() if use_mces else None
+        except Exception:
+            logger.exception("Failed to initialize MCES calculator; MCES metrics will use fallback distance.")
+            self.mces_calculator = None
 
     def is_valid_smiles(self, smiles_str: str):
         if not isinstance(smiles_str, str): return False
@@ -95,6 +110,7 @@ class MolecularEvaluator:
             mol = Chem.MolFromSmiles(smiles_str)
             return mol is not None
         except Exception:
+            logger.debug("SMILES validity check failed for smiles=%r", smiles_str, exc_info=True)
             return False
 
     def compute_tanimoto(self, mol_pred, mol_true):
@@ -103,6 +119,7 @@ class MolecularEvaluator:
             fp_true = AllChem.GetMorganFingerprintAsBitVect(mol_true, 2, nBits=2048)
             return DataStructs.TanimotoSimilarity(fp_pred, fp_true)
         except Exception:
+            logger.warning("Tanimoto calculation failed", exc_info=True)
             return 0.0
 
     def compute_mces(self, smiles_pred: str, smiles_true: str) -> float:
@@ -110,6 +127,7 @@ class MolecularEvaluator:
         try:
             return self.mces_calculator(smiles_pred, smiles_true)
         except Exception:
+            logger.exception("MCES metric failed for pred=%r true=%r", smiles_pred, smiles_true)
             return 100.0
 
     def compute_metrics(self, true_smiles: str, pred_smiles: str):
